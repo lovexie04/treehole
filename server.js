@@ -1,53 +1,70 @@
 /**
  * 🌲 树洞 API 服务器
- * 
- * 用 GitHub CLI (gh) 作为后端，GitHub Issues 作为数据库
- * 运行：node server.js
- * 然后打开 http://localhost:3000
+ * GitHub Issues 做数据库，Node.js 原生 HTTPS 请求调 API
+ * 修复：Windows 中文编码问题
  */
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
-const { execSync, spawnSync } = require('child_process');
+const { execSync } = require('child_process');
 
 const REPO = 'lovexie04/treehole';
 const PORT = 3000;
 
-// ========== GitHub Issues API (通过gh CLI) ==========
-
-/**
- * 执行 gh api 命令
- * 对于POST请求，用 stdin 传 JSON body 避免编码问题
- */
-function gh(method, endpoint, jsonBody) {
-  const args = ['api', endpoint, '-X', method, '--jq', '.'];
-  if (jsonBody) {
-    // 用 stdin 传 JSON
-    const result = spawnSync('gh', args, {
-      input: JSON.stringify(jsonBody),
-      encoding: 'utf8',
-      maxBuffer: 10 * 1024 * 1024
-    });
-    if (result.status !== 0) {
-      console.error('gh error:', result.stderr?.slice(0, 200));
-      return null;
-    }
-    try { return JSON.parse(result.stdout); } catch { return result.stdout; }
-  } else {
-    // GET 请求直接执行
-    const cmd = `gh api "${endpoint}" --jq "."`;
-    try {
-      return JSON.parse(execSync(cmd, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
-    } catch (e) {
-      console.error('gh error:', e.stderr?.slice(0, 200));
-      return null;
-    }
-  }
+// ========== 获取 GitHub Token ==========
+function getToken() {
+  try {
+    return execSync('gh auth token', { encoding: 'utf8' }).trim();
+  } catch { return null; }
 }
 
-function getPosts() {
-  const raw = gh('GET', `repos/${REPO}/issues`);
+// ========== Node.js 原生 GitHub API 请求 ==========
+function ghApi(method, endpoint, bodyObj) {
+  return new Promise((resolve) => {
+    const token = getToken();
+    if (!token) { resolve(null); return; }
+
+    const body = bodyObj ? JSON.stringify(bodyObj) : null;
+    const url = new URL(`https://api.github.com/${endpoint}`);
+
+    const options = {
+      hostname: 'api.github.com',
+      path: url.pathname + url.search,
+      method: method,
+      rejectUnauthorized: false,
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'treehole-server',
+        'Content-Type': 'application/json; charset=utf-8'
+      }
+    };
+
+    if (body) {
+      options.headers['Content-Length'] = Buffer.byteLength(body, 'utf8');
+    }
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch { resolve(data); }
+      });
+    });
+
+    req.on('error', () => resolve(null));
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+// ========== 业务函数 ==========
+
+async function getPosts() {
+  const raw = await ghApi('GET', `repos/${REPO}/issues`);
   if (!raw) return [];
   const issues = Array.isArray(raw) ? raw : [raw];
   return issues.map(issue => ({
@@ -60,17 +77,16 @@ function getPosts() {
   }));
 }
 
-function addPost(content) {
+async function addPost(content) {
   const title = content.split('\n')[0].slice(0, 72) || '树洞投稿';
-  const result = gh('POST', `repos/${REPO}/issues`, {
-    title: title,
-    body: content
+  const result = await ghApi('POST', `repos/${REPO}/issues`, {
+    title: title, body: content
   });
-  return result ? { id: result.number, time: result.created_at, url: result.html_url } : null;
+  return result && result.number ? { id: result.number, time: result.created_at, url: result.html_url } : null;
 }
 
-function getComments(issueNumber) {
-  const raw = gh('GET', `repos/${REPO}/issues/${issueNumber}/comments`);
+async function getComments(issueNumber) {
+  const raw = await ghApi('GET', `repos/${REPO}/issues/${issueNumber}/comments`);
   if (!raw) return [];
   const comments = Array.isArray(raw) ? raw : [raw];
   return comments.map(c => ({
@@ -81,31 +97,28 @@ function getComments(issueNumber) {
   }));
 }
 
-function addComment(issueNumber, content) {
-  const result = gh('POST', `repos/${REPO}/issues/${issueNumber}/comments`, {
+async function addComment(issueNumber, content) {
+  const result = await ghApi('POST', `repos/${REPO}/issues/${issueNumber}/comments`, {
     body: content
   });
-  return result ? { id: result.id, time: result.created_at } : null;
+  return result && result.id ? { id: result.id, time: result.created_at } : null;
 }
 
 // ========== HTTP Server ==========
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'application/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
+  '.css': 'text/css',
+  '.js': 'application/javascript',
+  '.json': 'application/json',
   '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.svg': 'image/svg+xml',
 };
 
 function serveFile(res, filePath) {
   const ext = path.extname(filePath);
-  const mime = MIME[ext] || 'application/octet-stream';
   try {
     const content = fs.readFileSync(filePath);
-    res.writeHead(200, { 'Content-Type': mime, 'Access-Control-Allow-Origin': '*' });
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Access-Control-Allow-Origin': '*' });
     res.end(content);
   } catch {
     res.writeHead(404);
@@ -113,113 +126,72 @@ function serveFile(res, filePath) {
   }
 }
 
+function json(res, status, data) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(data));
+}
+
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // 解析请求体
   function readBody() {
-    return new Promise((resolve) => {
-      let body = '';
-      req.on('data', chunk => body += chunk);
-      req.on('end', () => {
-        try { resolve(JSON.parse(body)); } catch { resolve(null); }
-      });
+    return new Promise(resolve => {
+      let b = '';
+      req.on('data', c => b += c);
+      req.on('end', () => { try { resolve(JSON.parse(b)); } catch { resolve(null); } });
     });
   }
 
-  // ===== API 路由 =====
+  // ===== Routes =====
 
-  // GET /api/posts - 获取所有帖子
   if (req.method === 'GET' && req.url === '/api/posts') {
-    const posts = getPosts();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true, data: posts }));
+    getPosts().then(posts => json(res, 200, { success: true, data: posts }));
     return;
   }
 
-  // POST /api/posts - 发布帖子
   if (req.method === 'POST' && req.url === '/api/posts') {
-    readBody().then(async (body) => {
-      if (!body || !body.content || !body.content.trim()) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: '内容不能为空' }));
-        return;
-      }
-      if (body.content.length > 500) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: '内容不能超过500字' }));
-        return;
-      }
-      const result = addPost(body.content.trim());
-      if (result) {
-        res.writeHead(201, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, data: result }));
-      } else {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: '发布失败，请稍后再试' }));
-      }
+    readBody().then(async body => {
+      if (!body || !body.content || !body.content.trim()) return json(res, 400, { success: false, error: '内容不能为空' });
+      if (body.content.length > 500) return json(res, 400, { success: false, error: '内容不能超过500字' });
+      const result = await addPost(body.content.trim());
+      if (result) json(res, 201, { success: true, data: result });
+      else json(res, 500, { success: false, error: '发布失败' });
     });
     return;
   }
 
-  // GET/POST /api/posts/:id/comments - 查看/添加评论
   const commentMatch = req.url.match(/^\/api\/posts\/(\d+)\/comments$/);
   if (commentMatch) {
     const issueId = commentMatch[1];
-
     if (req.method === 'GET') {
-      const comments = getComments(issueId);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, data: comments }));
+      getComments(issueId).then(comments => json(res, 200, { success: true, data: comments }));
       return;
     }
-
     if (req.method === 'POST') {
-      readBody().then(async (body) => {
-        if (!body || !body.content || !body.content.trim()) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: '内容不能为空' }));
-          return;
-        }
-        if (body.content.length > 200) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: '回复不能超过200字' }));
-          return;
-        }
-        const result = addComment(issueId, body.content.trim());
-        if (result) {
-          res.writeHead(201, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, data: result }));
-        } else {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: '回复失败，请稍后再试' }));
-        }
+      readBody().then(async body => {
+        if (!body || !body.content || !body.content.trim()) return json(res, 400, { success: false, error: '内容不能为空' });
+        if (body.content.length > 200) return json(res, 400, { success: false, error: '回复不能超过200字' });
+        const result = await addComment(issueId, body.content.trim());
+        if (result) json(res, 201, { success: true, data: result });
+        else json(res, 500, { success: false, error: '回复失败' });
       });
       return;
     }
   }
 
-  // ===== 静态文件 =====
-  if (req.url === '/' || req.url === '') {
-    serveFile(res, path.join(__dirname, 'index.html'));
-  } else {
-    serveFile(res, path.join(__dirname, req.url));
-  }
+  // 静态文件
+  if (req.url === '/' || req.url === '') serveFile(res, path.join(__dirname, 'index.html'));
+  else serveFile(res, path.join(__dirname, req.url));
 });
 
 server.listen(PORT, () => {
   console.log(`\n  🌲 树洞服务器已启动！`);
   console.log(`  ───────────────────────────`);
   console.log(`  本地访问: http://localhost:${PORT}`);
-  console.log(`  GitHub:   https://github.com/${REPO}`);
   console.log(`  ───────────────────────────`);
   console.log(`  按 Ctrl+C 停止服务器\n`);
 });
