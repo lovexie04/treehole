@@ -321,19 +321,64 @@
 <div class="toast" id="toast"></div>
 
 <script>
-// ========== 💾 数据 ==========
-const STORAGE_KEY = 'treehole_posts';
-let posts = loadPosts();
+// ========== 💾 数据 / 模式 ==========
+const STORAGE_KEY = '***';
+const API_BASE = window.location.origin + '/api';
+let mode = 'local'; // 'local' | 'server'
+let posts = [];
 let currentFilter = 'all';
 
+// ========== 🌐 检测服务端模式 ==========
+async function detectMode() {
+  try {
+    await checkServerMode();
+  } catch {}
+  // 再试一次
+  setTimeout(async () => {
+    try {
+      const res = await fetch(API_BASE + '/posts');
+      if (res.ok) {
+        mode = 'server';
+        const data = await res.json();
+        if (data.success && data.data.length > 0) {
+          posts = data.data.map(p => ({
+            id: 'gh-' + p.id,
+            content: p.content,
+            author: '🌲 树洞居民',
+            color: '#6366f1',
+            time: p.time,
+            likes: p.likes || 0,
+            liked: false
+          }));
+          renderFeed();
+        }
+      }
+    } catch {}
+  }, 500);
+}
+
+async function checkServerMode() {
+  const resp = await fetch(API_BASE + '/posts', { signal: AbortSignal.timeout(2000) });
+  if (resp.ok) {
+    const data = await resp.json();
+    if (data.success) {
+      mode = 'server';
+      document.querySelector('header p').textContent = '✨ 多人在线 · 说你想说的，没人知道你是谁';
+      const btn = document.querySelector('.post-btn');
+      btn.textContent = '🌱 扔进树洞';
+      return true;
+    }
+  }
+  return false;
+}
+
 // ========== 🛠️ 工具 ==========
-function loadPosts() {
+function loadLocalPosts() {
   try {
     return JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
   } catch { return []; }
 }
-
-function savePosts() {
+function saveLocalPosts() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(posts));
 }
 
@@ -354,22 +399,12 @@ function timeAgo(dateStr) {
 }
 
 function getRandomColor() {
-  const colors = [
-    '#6366f1','#8b5cf6','#ec4899','#f43f5e',
-    '#f59e0b','#10b981','#06b6d4','#3b82f6',
-    '#a855f7','#ef4444','#14b8a6','#d946ef'
-  ];
+  const colors = ['#6366f1','#8b5cf6','#ec4899','#f43f5e','#f59e0b','#10b981','#06b6d4','#3b82f6','#a855f7','#ef4444','#14b8a6','#d946ef'];
   return colors[Math.floor(Math.random() * colors.length)];
 }
 
 function getAnonName() {
-  const names = [
-    '匿名的小猫','树洞里的星星','藏在云里的人','路过的人',
-    '深夜独白','一个影子','沉默的鱼','风的孩子',
-    '失眠患者','月亮邮递员','某个角落','第三棵树',
-    '迷雾行者','蓝色鲸鱼','昨夜星辰','无名访客',
-    '远方的歌','半杯月光','哑巴诗人','白日梦想家'
-  ];
+  const names = ['匿名的小猫','树洞里的星星','藏在云里的人','路过的人','深夜独白','一个影子','沉默的鱼','风的孩子','失眠患者','月亮邮递员','某个角落','第三棵树','迷雾行者','蓝色鲸鱼','昨夜星辰','无名访客','远方的歌','半杯月光','哑巴诗人','白日梦想家'];
   return names[Math.floor(Math.random() * names.length)];
 }
 
@@ -396,7 +431,7 @@ function initParticles() {
 }
 initParticles();
 
-// ========== 📝 发帖 ==========
+// ========== ✍️ 发帖 ==========
 document.getElementById('postInput').addEventListener('input', function() {
   const len = this.value.length;
   const max = 500;
@@ -406,11 +441,60 @@ document.getElementById('postInput').addEventListener('input', function() {
   document.getElementById('postBtn').disabled = len === 0 || len > max;
 });
 
-document.getElementById('postBtn').addEventListener('click', function() {
+document.getElementById('postBtn').addEventListener('click', async function() {
   const input = document.getElementById('postInput');
   const text = input.value.trim();
   if (!text) return;
 
+  this.disabled = true;
+  this.textContent = '⏳ 正在投递...';
+
+  if (mode === 'server') {
+    try {
+      const res = await fetch(API_BASE + '/posts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: text })
+      });
+      if (res.ok) {
+        toast('🌱 已扔进树洞！所有人可见');
+        input.value = '';
+        document.getElementById('charCount').textContent = '0 / 500';
+        this.textContent = '🌱 扔进树洞';
+        // 刷新
+        const reload = await fetch(API_BASE + '/posts');
+        if (reload.ok) {
+          const data = await reload.json();
+          if (data.success) {
+            posts = data.data.map(p => ({
+              id: 'gh-' + p.id,
+              content: p.content,
+              author: '🌲 树洞居民',
+              color: '#6366f1',
+              time: p.time,
+              likes: p.likes || 0,
+              liked: false
+            }));
+            renderFeed();
+            return;
+          }
+        }
+      } else {
+        toast('❌ 发布失败，请重试');
+        this.textContent = '🌱 扔进树洞';
+        this.disabled = false;
+      }
+    } catch {
+      toast('❌ 网络错误，转为本地存储');
+      mode = 'local';
+      fallbackToLocal(text);
+    }
+  } else {
+    fallbackToLocal(text);
+  }
+});
+
+function fallbackToLocal(text) {
   const post = {
     id: generateId(),
     content: text,
@@ -420,15 +504,14 @@ document.getElementById('postBtn').addEventListener('click', function() {
     likes: 0,
     liked: false
   };
-
   posts.unshift(post);
-  savePosts();
-  input.value = '';
+  saveLocalPosts();
+  document.getElementById('postInput').value = '';
   document.getElementById('charCount').textContent = '0 / 500';
-  this.disabled = true;
+  document.getElementById('postBtn').textContent = '🌱 扔进树洞';
   renderFeed();
-  toast('🌱 你的秘密已藏进树洞');
-});
+  toast(mode === 'server' ? '🌱 已转为本地保存' : '🌱 你的秘密已藏进树洞（仅本地可见）');
+}
 
 // ========== 🎯 筛选 ==========
 document.querySelectorAll('.filter-btn').forEach(btn => {
@@ -442,11 +525,8 @@ document.querySelectorAll('.filter-btn').forEach(btn => {
 
 function getFilteredPosts() {
   let list = [...posts];
-  if (currentFilter === 'recent') {
-    list.sort((a, b) => new Date(b.time) - new Date(a.time));
-  } else if (currentFilter === 'hot') {
-    list.sort((a, b) => b.likes - a.likes);
-  }
+  if (currentFilter === 'recent') list.sort((a, b) => new Date(b.time) - new Date(a.time));
+  else if (currentFilter === 'hot') list.sort((a, b) => b.likes - a.likes);
   return list;
 }
 
@@ -454,17 +534,10 @@ function getFilteredPosts() {
 function renderFeed() {
   const feed = document.getElementById('feed');
   const list = getFilteredPosts();
-
   if (list.length === 0) {
-    feed.innerHTML = `
-      <div class="empty-state">
-        <div class="emoji">🍃</div>
-        <p>树洞还是空的。<br>写下第一个秘密吧。</p>
-      </div>
-    `;
+    feed.innerHTML = `<div class="empty-state"><div class="emoji">🍃</div><p>树洞还是空的。<br>写下第一个秘密吧。</p></div>`;
     return;
   }
-
   feed.innerHTML = list.map(post => `
     <div class="card" data-id="${post.id}">
       <div class="card-meta">
@@ -475,7 +548,7 @@ function renderFeed() {
         <span class="card-time">${timeAgo(post.time)}</span>
       </div>
       <div class="card-content">${escapeHtml(post.content)}</div>
-      <span class="card-tag">#匿名投稿</span>
+      <span class="card-tag">${mode === 'server' ? '#在线树洞' : '#匿名投稿'}</span>
       <div class="card-actions">
         <button class="action-btn ${post.liked ? 'liked' : ''}" onclick="toggleLike('${post.id}')">
           ${post.liked ? '❤️' : '🤍'} <span>${post.likes}</span>
@@ -497,12 +570,16 @@ function toggleLike(id) {
   if (!post) return;
   post.liked = !post.liked;
   post.likes += post.liked ? 1 : -1;
-  savePosts();
+  if (mode !== 'server') saveLocalPosts();
   renderFeed();
 }
 
-// ========== 🚀 初次渲染 ==========
+// ========== 🚀 启动 ==========
+// 先加载本地数据
+posts = loadLocalPosts();
 renderFeed();
+// 再尝试连接服务器
+detectMode();
 </script>
 </body>
 </html>
